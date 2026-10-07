@@ -328,211 +328,129 @@ def _parse_river_spec(river_raw: str, target_seat: int, x: int = 1, oya: int = 0
 
 
 
+# 基于天凤真实高段位牌谱统计拟合的各巡舍牌类别概率与摸切率分布
+REAL_RIVER_PROBS = {
+    1: {"wind": 0.466, "dragon": 0.126, "19": 0.334, "28": 0.042, "456": 0.032, "tsumo_rate": 0.073},
+    2: {"wind": 0.320, "dragon": 0.211, "19": 0.290, "28": 0.099, "456": 0.080, "tsumo_rate": 0.154},
+    3: {"wind": 0.209, "dragon": 0.230, "19": 0.263, "28": 0.151, "456": 0.147, "tsumo_rate": 0.226},
+    4: {"wind": 0.164, "dragon": 0.185, "19": 0.247, "28": 0.196, "456": 0.208, "tsumo_rate": 0.313},
+    5: {"wind": 0.141, "dragon": 0.138, "19": 0.231, "28": 0.196, "456": 0.294, "tsumo_rate": 0.329},
+    6: {"wind": 0.140, "dragon": 0.100, "19": 0.219, "28": 0.211, "456": 0.330, "tsumo_rate": 0.408},
+}
+
 def _generate_default_rivers(
     hand_tiles: list[str],
     target_seat: int,
     oya: int,
     x: int,
     call_target_tile: str | None = None,
+    call_from_seat: int | None = None,
     partial_target_past: list[tuple[str, bool, bool]] | None = None,
     partial_opp_rivers: list[list[tuple[str, bool, bool]]] | None = None,
     dora_indicator: str | None = None,
 ) -> tuple[list[tuple[str, bool, bool]], list[list[tuple[str, bool, bool]]]]:
-    """当巡目 x >= 2 且用户未提供牌河时，自动生成四家物理合法、无冲突且符合牌理的牌河。
+    """Sample a deterministic physical prefix in current seat-wind coordinates.
 
-    抽样规则（按用户口径）：
-      1. 先剔除自己手牌及周边相关联牌（±1 邻张/进张），手中字牌绝对不出现；
-      2. 权重分层：字牌与无关联幺九 = 1.0，28 数牌 = 1/5，37 = 1/25，456 = 1/125；
-      3. 用确定性 RNG（同一局面同一牌河，便于复盘），避免“每次都切同一张”的死板牌河；
-      4. 第一巡四家不打相同牌，避免四风连打；若指定副露目标牌，则目标玩家的上家在
-         决策巡的上一舍必为该牌（保持响应时点因果正确）。
+    x is our next turn. A call ends immediately after the specified opponent's
+    discard following our (x-1)th discard; it may occur in the previous lap.
+    Choose an available category using REAL_RIVER_PROBS, renormalizing over
+    nonempty categories, then uniformly choose a tile kind within it. The
+    fitted tsumogiri rate is sampled independently. This is a synthetic prefix,
+    not an exact empirical joint river distribution. Explicit response rivers
+    bypass this function and are never padded.
     """
+    from collections import Counter
     import hashlib
+    import json
     import random
+    from mortal_app.call_context import base, tile
 
-    seed_material = "|".join(
-        sorted(hand_tiles)
-        + [f"oya{oya}", f"seat{target_seat}", f"x{x}", f"call{call_target_tile or ''}"]
-    )
-    rng = random.Random(int.from_bytes(hashlib.sha256(seed_material.encode()).digest()[:8], "big"))
-
-    def _tile_weight(t: str) -> float:
-        if t in ("0m", "5mr"): t = "5m"
-        elif t in ("0p", "5pr"): t = "5p"
-        elif t in ("0s", "5sr"): t = "5s"
-        if t.endswith("z"):
-            return 1.0
-        n = int(t[0])
-        if n in (1, 9):
-            return 1.0
-        if n in (2, 8):
-            return 0.2
-        if n in (3, 7):
-            return 0.04
-        return 0.008
-    forbidden = set()
-    for t in hand_tiles:
-        if t in ("0m", "5mr"):
-            t = "5m"
-        elif t in ("0p", "5pr"):
-            t = "5p"
-        elif t in ("0s", "5sr"):
-            t = "5s"
-        forbidden.add(t)
-        if t.endswith("z"):
-            continue
-        suit = t[-1]
-        num = int(t[0])
-        # 排除邻张与搭子进张 (num-1, num+1)
-        if num > 1:
-            forbidden.add(f"{num-1}{suit}")
-        if num < 9:
-            forbidden.add(f"{num+1}{suit}")
-
-    # 优先级出牌池：字牌 -> 幺九 (1,9) -> 28 -> 37 -> 456
-    TILES_BY_PRIORITY = (
-        ["1z", "2z", "3z", "4z", "5z", "6z", "7z"] +
-        ["1m", "9m", "1p", "9p", "1s", "9s"] +
-        ["2m", "8m", "2p", "8p", "2s", "8s"] +
-        ["3m", "7m", "3p", "7p", "3s", "7s"] +
-        ["4m", "6m", "5m", "4p", "6p", "5p", "4s", "6s", "5s"]
-    )
-    allowed_pool = [t for t in TILES_BY_PRIORITY if t not in forbidden]
-
-    tile_used_counts: dict[str, int] = {}
-    for t in hand_tiles:
-        if t in ("0m", "5mr"):
-            t = "5m"
-        elif t in ("0p", "5pr"):
-            t = "5p"
-        elif t in ("0s", "5sr"):
-            t = "5s"
-        tile_used_counts[t] = tile_used_counts.get(t, 0) + 1
-
-    normal_fives = {f"5{s}": hand_tiles.count(f"5{s}") for s in "mps"}
-    if dora_indicator:
-        indicator = "5" + dora_indicator[1:] if dora_indicator.startswith("0") else dora_indicator
-        tile_used_counts[indicator] = tile_used_counts.get(indicator, 0) + 1
-        if dora_indicator in normal_fives:
-            normal_fives[dora_indicator] += 1
-
+    hand_tiles = list(map(tile, hand_tiles))
+    dora_indicator = tile(dora_indicator) if dora_indicator else None
+    call_target_tile = tile(call_target_tile) if call_target_tile else None
+    call_player = (target_seat + 3) % 4 if call_from_seat is None else call_from_seat
+    pos_target = (target_seat - oya) % 4
+    total = 4 * (x - 1) + pos_target
+    if call_target_tile:
+        if call_player not in range(4) or call_player == target_seat:
+            raise ValueError("供牌家必须是其他玩家，不能响应自己的弃牌")
+        total = 4 * (x - 2) + pos_target + 1 + (call_player - target_seat) % 4
+        if total <= 0:
+            raise ValueError("指定供牌家在自家第1巡前尚未弃牌，不能补出未来弃牌")
+    limits = [sum((oya + i) % 4 == p for i in range(total)) for p in range(4)]
     rivers: list[list[tuple[str, bool, bool]]] = [[], [], [], []]
-    if partial_target_past:
-        rivers[target_seat] = list(partial_target_past)
+    rivers[target_seat] = list(partial_target_past or [])
     if partial_opp_rivers:
         for p in range(4):
             if p != target_seat and p < len(partial_opp_rivers):
                 rivers[p] = list(partial_opp_rivers[p] or [])
-
-    # 预先将用户已指定牌河中的牌计入使用计数
-    for p in range(4):
-        for tok in rivers[p]:
-            t = tok[0]
-            if t in normal_fives:
-                normal_fives[t] += 1
-            if t in ("0m", "5mr"): t = "5m"
-            elif t in ("0p", "5pr"): t = "5p"
-            elif t in ("0s", "5sr"): t = "5s"
-            tile_used_counts[t] = tile_used_counts.get(t, 0) + 1
-
-    pos_target = (target_seat + 4 - oya) % 4
-    call_round = x - 1 if pos_target == 0 else x
-    call_player = (target_seat + 3) % 4
-    if call_target_tile and len(rivers[call_player]) < call_round:
-        key = "5" + call_target_tile[1:] if call_target_tile.startswith("0") else call_target_tile
-        tile_used_counts[key] = tile_used_counts.get(key, 0) + 1
-        if call_target_tile in normal_fives:
-            normal_fives[call_target_tile] += 1
-    if any(n > 4 for n in tile_used_counts.values()) or any(n > 3 for n in normal_fives.values()):
+    if call_target_tile and any(len(row) > limits[p] for p, row in enumerate(rivers)):
+        raise ValueError("指定供牌家与牌河时序不一致，不能补出未来弃牌")
+    seed_material = json.dumps(
+        [sorted(hand_tiles), oya, target_seat, x, call_target_tile, call_player,
+         dora_indicator, rivers], ensure_ascii=False, separators=(",", ":"),
+    )
+    rng = random.Random(int.from_bytes(hashlib.sha256(seed_material.encode()).digest()[:8], "big"))
+    visible = hand_tiles + ([dora_indicator] if dora_indicator else [])
+    visible += [tile(e[0]) for row in rivers for e in row]
+    # Reserve the exact physical called tile BEFORE generating older discards.
+    if call_target_tile:
+        if len(rivers[call_player]) < limits[call_player]:
+            visible.append(call_target_tile)
+        elif rivers[call_player][-1][0] != call_target_tile:
+            raise ValueError("副露目标与指定供牌家最新弃牌不一致")
+    counts = Counter(map(base, visible))
+    physical = Counter(visible)
+    if (any(n > 4 for n in counts.values()) or
+            any(physical[f"5{s}"] > 3 or physical[f"0{s}"] > 1 for s in "mps")):
         raise ValueError("手牌、宝牌指示和响应弃牌存在超出物理数量的牌")
 
-    # 每张牌被各家切出的历史记录（避免一家频繁来回切相同牌）
-    player_discard_history: list[list[str]] = [[tok[0] for tok in rivers[p]] for p in range(4)]
+    categories = {
+        "wind": [f"{n}z" for n in range(1, 5)],
+        "dragon": [f"{n}z" for n in range(5, 8)],
+        "19": [f"{n}{s}" for s in "mps" for n in (1, 9)],
+        "28": [f"{n}{s}" for s in "mps" for n in (2, 8)],
+        "456": [f"{n}{s}" for s in "mps" for n in range(3, 8)],
+    }
+    all_tiles = [t for pool in categories.values() for t in pool]
+    forbidden = set(map(base, hand_tiles))
+    for t in list(forbidden):
+        if t[-1] in "mps":
+            n = int(t[0])
+            forbidden.update(f"{adj}{t[-1]}" for adj in (n - 1, n + 1) if 1 <= adj <= 9)
+    own_honors = {t for t in hand_tiles if t.endswith("z")}
 
-    def pick_tile_for_player(p_idx: int, turn_idx: int, used_this_turn: set[str]) -> str:
-        # 该玩家上一巡打出的牌（严禁连续手切同一张牌）
-        last_discard = rivers[p_idx][-1][0] if rivers[p_idx] else None
+    def pick(p: int, turn: int, used: set[str]) -> tuple[str, bool, bool]:
+        last = base(rivers[p][-1][0]) if rivers[p] else None
+        def legal(t: str) -> bool:
+            return (counts[t] < 4 and (t not in ("5m", "5p", "5s") or physical[t] < 3)
+                    and t != last and t not in own_honors and (turn > 1 or t not in used))
+        available = [t for t in all_tiles if t not in forbidden and legal(t)]
+        if not available:
+            # Relax shape preferences only; physical limits and own honors remain.
+            available = [t for t in all_tiles if legal(t)]
+        if not available:
+            raise ValueError("无法生成满足实物牌数的默认牌河，请提供完整真实牌河")
+        pools = {cat: [t for t in pool if t in available] for cat, pool in categories.items()}
+        cats = [cat for cat, pool in pools.items() if pool]
+        probs = REAL_RIVER_PROBS.get(turn, REAL_RIVER_PROBS[6])
+        category = rng.choices(cats, weights=[probs[cat] for cat in cats], k=1)[0]
+        chosen = rng.choice(pools[category])
+        counts[chosen] += 1
+        physical[chosen] += 1
+        return chosen, turn > 1 and rng.random() < probs["tsumo_rate"], False
 
-        def can_pick(candidate: str) -> bool:
-            if tile_used_counts.get(candidate, 0) >= 4 or normal_fives.get(candidate, 0) >= 3:
-                return False
-            if last_discard is not None and candidate == last_discard:
-                return False
-            if turn_idx == 1 and candidate in used_this_turn:
-                return False
-            return True
+    for i in range(total):
+        p, turn = (oya + i) % 4, i // 4 + 1
+        used = {base(rivers[q][turn - 1][0]) for q in range(4) if len(rivers[q]) >= turn}
+        if len(rivers[p]) >= turn:
+            continue
+        if call_target_tile and i == total - 1:
+            rivers[p].append((call_target_tile, False, False))
+        else:
+            rivers[p].append(pick(p, turn, used))
+    return rivers[target_seat], [rivers[p] if p != target_seat else [] for p in range(4)]
 
-        def weighted_choice(cands: list[str]) -> str:
-            weights = [_tile_weight(c) for c in cands]
-            return rng.choices(cands, weights=weights, k=1)[0]
-
-        valid_candidates = [t for t in allowed_pool if can_pick(t)]
-        if valid_candidates:
-            best_tile = weighted_choice(valid_candidates)
-            tile_used_counts[best_tile] = tile_used_counts.get(best_tile, 0) + 1
-            if best_tile in normal_fives:
-                normal_fives[best_tile] += 1
-            used_this_turn.add(best_tile)
-            player_discard_history[p_idx].append(best_tile)
-            return best_tile
-
-        # 候选不足时，从全局合法牌池补充
-        valid_fallback = [t for t in TILES_BY_PRIORITY if t not in hand_tiles and can_pick(t)]
-        if valid_fallback:
-            best_tile = weighted_choice(valid_fallback)
-            tile_used_counts[best_tile] = tile_used_counts.get(best_tile, 0) + 1
-            if best_tile in normal_fives:
-                normal_fives[best_tile] += 1
-            used_this_turn.add(best_tile)
-            player_discard_history[p_idx].append(best_tile)
-            return best_tile
-
-        # 终极保底：未满 4 张且非上一打
-        final_pool = [t for t in TILES_BY_PRIORITY if can_pick(t) and not (t.endswith("z") and t in hand_tiles)]
-        if final_pool:
-            picked = weighted_choice(final_pool)
-            tile_used_counts[picked] = tile_used_counts.get(picked, 0) + 1
-            if picked in normal_fives:
-                normal_fives[picked] += 1
-            used_this_turn.add(picked)
-            player_discard_history[p_idx].append(picked)
-            return picked
-
-        raise ValueError("无法生成满足实物牌数的默认牌河，请提供完整真实牌河")
-
-    pos_target = (target_seat + 4 - oya) % 4
-
-    for r in range(1, x + 1):
-        used_this_turn: set[str] = set()
-        for offset in range(4):
-            p = (oya + offset) % 4
-            pos_p = offset
-            if r == x and pos_p == pos_target:
-                break
-            if r == x and pos_p > pos_target:
-                continue
-
-            # 若玩家 p 在此巡已有用户指定的舍牌，则直接沿用，不重复生成
-            if len(rivers[p]) >= r:
-                t = rivers[p][r - 1][0]
-                norm_t = "5m" if t in ("0m", "5mr") else ("5p" if t in ("0p", "5pr") else ("5s" if t in ("0s", "5sr") else t))
-                used_this_turn.add(norm_t)
-                continue
-
-            # 吃/碰目标牌必须落在目标玩家真正能响应的上一张舍牌上。
-            # 目标玩家若是本巡第一家，则该牌来自上一巡末家；否则来自本巡目标玩家前一家。
-            call_round = x - 1 if pos_target == 0 else x
-            call_player = (oya + 3) % 4 if pos_target == 0 else (oya + pos_target - 1) % 4
-            if call_target_tile and r == call_round and p == call_player:
-                tile = call_target_tile
-                used_this_turn.add(tile)  # already reserved before sampling
-            else:
-                tile = pick_tile_for_player(p, r, used_this_turn)
-            rivers[p].append((tile, False, False))
-
-    target_past = rivers[target_seat]
-    opp_rivers = [rivers[p] if p != target_seat else [] for p in range(4)]
-    return target_past, opp_rivers
 
 def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
     """解析精简 /sim 指令。"""
@@ -635,7 +553,7 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
         return None, "显式牌河含无法解析的舍牌或字符"
 
     # 7. 提取候选 c... (支持 c=... 或 ctsumo,...)
-    cand_m = re.search(r'(?i)(?:^|(?<=[\s,;]))[cC][:：=]?([a-zA-Z0-9mpszkrKR>:\-_,，、\(\)（）@\u4e00-\u9fa5]+?)(?=\s+[pPdDeEwWsSxX]|\s+\d+\b|\s*$)', rest)
+    cand_m = re.search(r'(?i)(?:^|(?<=[\s,;]))[cC][:：=]?([a-zA-Z0-9mpszkrKR>:\-_,，、\[\]\(\)（）@\u4e00-\u9fa5]+?)(?=\s+[pPdDeEwWsSxX]|\s+\d+\b|\s*$)', rest)
     cand_raw = None
     if cand_m:
         cand_raw = cand_m.group(1).strip()
@@ -869,6 +787,16 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
                 # pon:5m (all physical pairs), pon:5m@05m (exact pair),
                 # optional >discard. Bare pon binds to an explicit river first.
                 from mortal_app.call_context import base
+                call_from_seat = None
+                source_match = re.search(r'[\[\(（](东|南|西|北|0|1|2|3|[eswnESWN]|下家|对家|上家|shimocha|toimen|kamicha)[\]\)）]', part, re.IGNORECASE)
+                if source_match:
+                    source_token = source_match.group(1).lower()
+                    relative_sources = {"下家": 1, "shimocha": 1, "对家": 2, "toimen": 2, "上家": 3, "kamicha": 3}
+                    call_from_seat = ((effective_target_seat + relative_sources[source_token]) % 4
+                                      if source_token in relative_sources else SEAT_MAP[source_token])
+                    if call_from_seat == effective_target_seat:
+                        return None, "供牌家不能是自己"
+                    part = part[:source_match.start()] + part[source_match.end():]
                 match = re.fullmatch(r"(?:pon|碰)[:：]?([^>@]*)(?:@([^>]+))?(?:>(.+))?", part, re.IGNORECASE)
                 if not match:
                     return None, f"碰牌候选格式错误：{part}"
@@ -895,6 +823,7 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
                 cand_dict = {
                     "tile": "pon", "riichi": False, "kan": False, "kyushu": False,
                     "pon": True, "call_tile": pon_target, "follow_up_discard": fu_tile,
+                    "call_from_seat": call_from_seat,
                 }
                 if consumed is not None:
                     cand_dict["pon_consumed"] = consumed
@@ -972,9 +901,11 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
     opp_rivers = None
     prefix_melds = []
     call_tile = None
+    call_from = None
     for cand in candidates:
         if cand.get("call_tile"):
             call_tile = cand["call_tile"]
+            call_from = cand.get("call_from_seat")
             break
 
     # CLI seat=东南西北 names CURRENT seat winds, not initial player IDs.
@@ -1010,6 +941,12 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
         # at the end of the caller's nominal turn. Chi is restricted to kamicha;
         # pon/pass/ron may respond before the other opponents take that turn.
         possible = None
+        sources = {c["call_from_seat"] for c in candidates if c.get("call_from_seat") is not None}
+        if len(sources) > 1:
+            return None, "响应候选必须指定同一供牌家"
+        call_from = next(iter(sources), None)
+        if any(c.get("chi") for c in candidates) and call_from not in (None, (effective_target_seat + 3) % 4):
+            return None, "吃牌只能响应上家的最新弃牌"
         for c in candidates:
             choices = None
             if c.get("call_tile"):
@@ -1027,6 +964,8 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
                 actor, latest_tile = latest_response_discard(explicit_rivers, 0, effective_target_seat, x_val)
             except ValueError as exc:
                 return None, str(exc)
+            if call_from is not None and call_from != actor:
+                return None, "指定供牌家与牌河最新弃牌来源不一致"
             if any(c.get("chi") for c in candidates) and actor != (effective_target_seat + 3) % 4:
                 return None, "吃牌只能响应上家的最新弃牌；碰牌可响应任意对手"
             latest = {latest_tile}
@@ -1073,6 +1012,7 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
             target_past, opp_rivers = _generate_default_rivers(
                 hand_tiles, effective_target_seat, effective_oya, x_val,
                 call_target_tile=call_tile,
+                call_from_seat=call_from,
                 partial_target_past=parsed_target_past,
                 partial_opp_rivers=parsed_opp_rivers,
                 dora_indicator=dora_indicator,
@@ -1128,6 +1068,9 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
         for key in ("actor", "target"):
             if meld.get(key) is not None:
                 meld[key] = (round_oya + meld[key]) % 4
+    for candidate in candidates:
+        if candidate.get("call_from_seat") is not None:
+            candidate["call_from_seat"] = (round_oya + candidate["call_from_seat"]) % 4
 
     # Repeat at the service boundary: a direct API request must obey the same
     # clock and physical constraints, independent of the bot parser.

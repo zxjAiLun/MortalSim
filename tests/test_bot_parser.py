@@ -81,4 +81,3 @@ def test_chi_explicit_call_tile_with_brackets_and_at():
     candidates = [c.get("candidate", "pass") for c in request["discards"]]
     assert candidates == ["chi:2m3m>9s", "chi:3m5m>9s", "chi:5m6m>9s", "pass"]
     assert request["opponent_rivers"][2][-1][0] == "4m"
-

@@ -180,6 +180,7 @@ def normalize_candidate(value: Any) -> dict[str, Any]:
             "pon_consumed": value.get("pon_consumed"),
             "daiminkan": minkan_val,
             "call_tile": value.get("call_tile"),
+            "call_from_seat": value.get("call_from_seat"),
             "follow_up_discard": fu_val,
             "candidate": c_id,
         }
@@ -1357,9 +1358,11 @@ def _merge_hanchan(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any
         name: _merge_mean(lm["dan_pt_ev"][name], rm["dan_pt_ev"][name])
         for name in HANCHAN_PT_TABLES
     }
-    m_left = lm.get("mleague_pt_ev") or left.get("mleague_pt_ev") or {"value": 0.0, "stddev": 0.0, "ci95": None, "n": 0, "sum": 0.0, "sum_sq": 0.0}
-    m_right = rm.get("mleague_pt_ev") or right.get("mleague_pt_ev") or {"value": 0.0, "stddev": 0.0, "ci95": None, "n": 0, "sum": 0.0, "sum_sq": 0.0}
-    mleague_pt_ev = _merge_mean(m_left, m_right)
+    m_left = lm.get("mleague_pt_ev") or left.get("mleague_pt_ev")
+    m_right = rm.get("mleague_pt_ev") or right.get("mleague_pt_ev")
+    # Older summaries persisted this metric only at the top level. Missing
+    # batches cannot contribute zero-valued samples to a cumulative estimate.
+    mleague_pt_ev = _merge_mean(m_left, m_right) if m_left is not None and m_right is not None else None
     for field in ("coordinate_system", "continuation_method"):
         if lm.get(field) != rm.get(field):
             raise ValueError(f"hanchan merge semantic mismatch: {field}")
@@ -1367,19 +1370,21 @@ def _merge_hanchan(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any
         "expected_rank": expected_rank,
         "rank_rates": rank_rates,
         "dan_pt_ev": dan_pt_ev,
-        "mleague_pt_ev": mleague_pt_ev,
         "coordinate_system": lm.get("coordinate_system"),
         "continuation_method": lm.get("continuation_method"),
     }
     games = int(left.get("sample", {}).get("games", 0) or 0) + int(right.get("sample", {}).get("games", 0) or 0)
-    return {
+    res = {
         "expected_rank": expected_rank,
         "rank_rates": rank_rates,
         "dan_pt_ev": dan_pt_ev,
-        "mleague_pt_ev": mleague_pt_ev,
         "merge_state": merge_state,
         "sample": {"games": games, "completed_games": games, "errors": 0},
     }
+    if mleague_pt_ev is not None:
+        res["mleague_pt_ev"] = mleague_pt_ev
+        merge_state["mleague_pt_ev"] = mleague_pt_ev
+    return res
 
 
 def merge_results(base: dict[str, Any], extra: dict[str, Any], operation_id: str) -> dict[str, Any]:
@@ -1787,22 +1792,52 @@ def run_analysis(request: dict[str, Any], emit: Callable[[dict[str, Any]], None]
                 "win_rate": acc.win_rate,
                 "deal_in_rate": acc.deal_in_rate,
             }
-            # Overwrite value & hanchan pt with cumulative high-precision moments
+            # Overwrite value & hanchan pt with cumulative high-precision moments and exact recomputed CI95
+            n_acc = acc.runs
+            crit_t = _t_critical(max(1, n_acc - 1))
+            sqrt_n = math.sqrt(n_acc) if n_acc > 0 else 1.0
+
             if "value" in pub and "point" in pub["value"]:
                 pub["value"]["point"]["value"] = acc.mean_score
                 pub["value"]["point"]["stddev"] = acc.stddev_score
-                pub["value"]["point"]["n"] = acc.runs
+                pub["value"]["point"]["n"] = n_acc
+                if n_acc >= 2 and acc.stddev_score is not None:
+                    margin_sc = crit_t * acc.stddev_score / sqrt_n
+                    ci_sc = [acc.mean_score - margin_sc, acc.mean_score + margin_sc]
+                    pub["value"]["point"]["ci95"] = ci_sc
+                    pub["cumulative"]["ci95_score"] = ci_sc
+                    pub["point_ci95"] = ci_sc
+                pub["avg_point"] = acc.mean_score
+
             if "hanchan" in pub:
                 if "dan_pt_ev" in pub["hanchan"] and "houou_7" in pub["hanchan"]["dan_pt_ev"]:
                     pub["hanchan"]["dan_pt_ev"]["houou_7"]["value"] = acc.mean_pt
                     pub["hanchan"]["dan_pt_ev"]["houou_7"]["stddev"] = acc.stddev_pt
+                    pub["hanchan"]["dan_pt_ev"]["houou_7"]["n"] = n_acc
+                    if n_acc >= 2 and acc.stddev_pt is not None:
+                        margin_pt = crit_t * acc.stddev_pt / sqrt_n
+                        ci_pt = [acc.mean_pt - margin_pt, acc.mean_pt + margin_pt]
+                        pub["hanchan"]["dan_pt_ev"]["houou_7"]["ci95"] = ci_pt
+                        pub["cumulative"]["ci95_pt"] = ci_pt
+
                 if "mleague_pt_ev" in pub["hanchan"]:
                     pub["hanchan"]["mleague_pt_ev"]["value"] = acc.mean_mleague
                     pub["hanchan"]["mleague_pt_ev"]["stddev"] = acc.stddev_mleague
+                    pub["hanchan"]["mleague_pt_ev"]["n"] = n_acc
+                    if n_acc >= 2 and acc.stddev_mleague is not None:
+                        margin_ml = crit_t * acc.stddev_mleague / sqrt_n
+                        ci_ml = [acc.mean_mleague - margin_ml, acc.mean_mleague + margin_ml]
+                        pub["hanchan"]["mleague_pt_ev"]["ci95"] = ci_ml
+                        pub["cumulative"]["ci95_mleague"] = ci_ml
+
             if "win" in pub and "rate" in pub["win"]:
-                pub["win"]["rate"]["rate"] = acc.win_rate
+                win_stats = _rate(acc.win_count, n_acc)
+                pub["win"]["rate"] = win_stats
+                pub["agari_rate"] = acc.win_rate
             if "defense" in pub and "deal_in_rate" in pub["defense"]:
-                pub["defense"]["deal_in_rate"]["rate"] = acc.deal_in_rate
+                deal_stats = _rate(acc.deal_in_count, n_acc)
+                pub["defense"]["deal_in_rate"] = deal_stats
+                pub["houjuu_rate"] = acc.deal_in_rate
         public_candidates.append(pub)
 
     comparisons = [_compare(candidates[0], candidate) for candidate in candidates[1:]]

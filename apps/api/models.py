@@ -75,6 +75,7 @@ class DiscardCandidate(BaseModel):
     pon_consumed: list[str] | None = Field(default=None, min_length=2, max_length=2)
     daiminkan: bool = False
     call_tile: str | None = None
+    call_from_seat: int | None = None
     follow_up_discard: str | None = None
     candidate: str | None = None
 

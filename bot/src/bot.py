@@ -9,6 +9,13 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+# 确保真实 MortalSim 根目录在模块搜索路径的最前列，杜绝被历史遗留目录 shadowing
+for _p_dir in [r"D:\tenhoulib\MortalSim", r"D:\tenhoulib\MortalSim\mortal_app", r"D:\tenhoulib"]:
+    if _p_dir not in sys.path:
+        sys.path.insert(0, _p_dir)
+
 import threading
 import time
 import uuid
@@ -66,6 +73,7 @@ class Bot:
         self.mortal_cfg = cfg["mortalsim"]
         self.quota_cfg = cfg["quota"]
         self.render_cfg = cfg["render"]
+        self.llm_cfg = cfg.get("llm", {})
         self.bot_self_qq = str(cfg["bot"]["self_qq"])
 
     def reload_config(self) -> None:
@@ -107,7 +115,8 @@ class Bot:
         sys.exit(0)
 
     def _is_admin(self, user_id: str) -> bool:
-        if user_id == "2361035324":
+        admin_list = [str(x) for x in self.bot_cfg.get("admin_qq", [])]
+        if user_id in admin_list:
             return True
         admins = self.bot_cfg.get("admin_qq") or []
         return str(user_id) in [str(x) for x in admins]
@@ -477,14 +486,17 @@ class Bot:
         if not text or text.startswith(("/help", "帮助", "help")):
             await self.send_group_text(
                 group_id,
-                "【Mortal 牌谱检讨 /review】\n"
-                "格式：/review <天凤/雀魂链接> [seat=0~3] [model=模型代号]\n"
-                "• 视角座次：默认取链接中的 tw 视角，也可显式指定 seat=0~3 (0东, 1南, 2西, 3北)\n"
-                "• 模型代号：Logos(默认基准) / Bastion(避四) / Nova-X(争一) / Consensus(共识) / Shadow-J(奇策)\n"
-                "• 示例：/review http://tenhou.net/0/?log=...&tw=1 seat=2 model=Nova-X\n\n"
-                "【局况蒙特卡洛仿真 /sim】\n"
-                "示例：/sim 123456789m789s12p d8p c1pr,2p S1-0 seat=南 x=3 P250,250,250,250 1000\n\n"
-                "/state 查看队列状态 | /取消 撤回任务",
+                "【Morta 推演中枢 快速指南】\n\n"
+                "🀄 牌谱复盘：\n"
+                "/review <链接> [tw/seat=0~3] [model=c/n/b/j]\n"
+                "• 示例：/review http://tenhou.net/0/?log=...&tw=1 model=n\n"
+                "• 模型：c(共识/默认), n(争一), b(避四), j(奇策)\n\n"
+                "🎲 局况仿真：\n"
+                "/sim <14张手牌> d<宝牌> [条件...]\n"
+                "• 示例：/sim 123456789m789s12p d8p c1pr,2p S1-0 seat=南 1000\n\n"
+                "📊 状态管理：\n"
+                "• /state：查看当前 GPU 队列与状态\n"
+                "• /取消：撤回排队中或运行中的任务",
             )
             return
 
@@ -510,6 +522,18 @@ class Bot:
         if text.startswith("/sim"):
             request, error = parse_sim_command(text)
             if error:
+                # 若命令格式错误但启用了 LLM，尝试智能校正
+                if self.llm_cfg.get("enabled", False) and len(text) > 8:
+                    from nl_translator import route_user_intent
+                    intent = await route_user_intent(text, self.llm_cfg)
+                    if intent and intent.get("action") == "sim":
+                        fixed = str(intent.get("command") or "").strip()
+                        if fixed.startswith("/sim"):
+                            fixed_req, fixed_err = parse_sim_command(fixed)
+                            if not fixed_err:
+                                await self.send_group_text(group_id, f"💡 格式校正：{fixed}\n正在排队演算……以上。")
+                                await self._enqueue_sim(group_id, user_id, fixed_req)
+                                return
                 await self.send_group_text(group_id, error)
                 return
             await self._enqueue_sim(group_id, user_id, request)
@@ -524,7 +548,7 @@ class Bot:
             return
 
         if text.startswith(("/stop", "/shutdown", "/exit", "停机", "停止")):
-            if user_id == "2361035324" or user_id in [str(x) for x in self.bot_cfg.get("admin_qq", [])]:
+            if user_id in [str(x) for x in self.bot_cfg.get("admin_qq", [])]:
                 await self.send_group_text(group_id, "收到停机指令，Bot 进程已安全停止。")
                 try:
                     _bot_lock_path().unlink(missing_ok=True)
@@ -532,6 +556,85 @@ class Bot:
                     pass
                 sys.exit(0)
 
+        # 兜底自然语言智能识别：未命中固定指令但 @ 了机器人时，尝试识别麻将局面
+        if self.llm_cfg.get("enabled", False):
+            await self._handle_natural_language_sim(group_id, user_id, text)
+            return
+
+    async def _handle_natural_language_sim(self, group_id: int, user_id: str, text: str) -> None:
+        """调用意图路由引擎，支持取消、推演、复盘、状态及冷萌问答。"""
+        if not self.llm_cfg.get("enabled", False):
+            return
+        if len(text.strip()) < 2:
+            return
+
+        try:
+            from nl_translator import route_user_intent
+            intent = await route_user_intent(text, self.llm_cfg)
+        except Exception as exc:
+            log.warning("LLM 意图识别异常: %s", exc)
+            return
+
+        if not intent or not isinstance(intent, dict):
+            return
+
+        action = intent.get("action")
+        reply = str(intent.get("reply") or "").strip()
+
+        # 1. 任务取消 (由 Python 端严格基于消息发送者的 user_id 鉴权)
+        if action == "cancel":
+            removed = await self._cancel_user(user_id)
+            if removed:
+                msg = f"{reply}\n已终止你的 {removed} 个任务。" if reply else f"任务调度已中断。已终止你的 {removed} 个任务。"
+            else:
+                msg = "当前队列中无属于你的活跃任务。"
+            await self.send_group_text(group_id, msg)
+            return
+
+        # 2. 查询排队状态
+        if action == "state":
+            usage = self.quota.usage(user_id)
+            prefix = f"{reply}\n" if reply else ""
+            state_msg = (
+                f"{prefix}"
+                f"• 仿真队列：活跃 {self.active} / 排队 {self.tasks.qsize()}\n"
+                f"• 牌谱审查：活跃 {self.review_active} / 排队 {self.review_tasks.qsize()}\n"
+                f"• 今日调用：{usage['requests']} 次 ({usage['games']} 局)"
+            )
+            await self.send_group_text(group_id, state_msg)
+            return
+
+        # 3. 牌谱检讨
+        if action == "review":
+            url = str(intent.get("url") or "").strip()
+            if url:
+                if reply:
+                    await self.send_group_text(group_id, reply)
+                await self._enqueue_review(group_id, user_id, url)
+                return
+            await self.send_group_text(group_id, "未检测到对局链接。……无法解析。请提供天凤或雀魂牌谱。")
+            return
+
+        # 4. 局面推演
+        if action == "sim":
+            cmd = str(intent.get("command") or "").strip()
+            if cmd.startswith("/sim"):
+                request, error = parse_sim_command(cmd)
+                if error:
+                    await self.send_group_text(group_id, f"局面参数存在异常。……无法构建。\n{cmd}\n错误：{error}")
+                    return
+                prefix = f"{reply}\n" if reply else ""
+                await self.send_group_text(group_id, f"{prefix}💡 识别指令：{cmd}")
+                await self._enqueue_sim(group_id, user_id, request)
+                return
+            if reply:
+                await self.send_group_text(group_id, reply)
+            return
+
+        # 5. 战术规则问答 / 闲聊 / 质询
+        if reply:
+            await self.send_group_text(group_id, reply)
+            return
     async def _enqueue_review(self, group_id: int, user_id: str, source_str: str) -> None:
         if self.review_tasks.qsize() >= 3:
             await self.send_group_text(group_id, "当前跑谱审查队列已满 (最多排队 3 场)，请稍候再试。")
@@ -564,19 +667,92 @@ class Bot:
                 log.exception("review_worker 出现未捕获异常: %s", exc)
                 await asyncio.sleep(1.0)
 
+    @staticmethod
+    def _analyze_review_attribution(review_result: dict, target_seat: int) -> str:
+        """分析对局失分与恶手归因，生成莫塔风格的定性判词。"""
+        rev = review_result.get("review", {})
+        rating = rev.get("rating", 1.0) * 100
+        fatal_losses = []
+        big_mistakes = []
+
+        for kyoku in rev.get("kyokus", []):
+            b_name = ["东", "南", "西", "北"][kyoku.get("bakaze", 0)]
+            k_num = kyoku.get("kyoku", 0) + 1
+            h_num = kyoku.get("honba", 0)
+            h_str = f"{h_num}本场" if h_num > 0 else ""
+            kyoku_name = f"{b_name}{k_num}局{h_str}"
+
+            end_status = kyoku.get("end_status", [])
+            deal_in_event = next((ev for ev in end_status if ev.get("type") == "hora" and ev.get("target") == target_seat), None)
+
+            entries = kyoku.get("entries", [])
+            deal_in_is_consistent = True
+
+            if deal_in_event:
+                pts = abs(deal_in_event.get("deltas", [0, 0, 0, 0])[target_seat])
+                if entries:
+                    last_e = entries[-1]
+                    if not last_e.get("is_equal", True):
+                        deal_in_is_consistent = False
+                if pts >= 7700:
+                    fatal_losses.append({
+                        "kyoku": kyoku_name,
+                        "pts": pts,
+                        "consistent": deal_in_is_consistent,
+                    })
+
+            for e in entries:
+                if not e.get("is_equal", True):
+                    details = e.get("details", [])
+                    act = e.get("actual", {})
+                    act_q = next((d.get("q_value") or d.get("prob", 0) for d in details if d.get("action") == act), 0)
+                    exp_q = next((d.get("q_value") or d.get("prob", 0) for d in details if d.get("action") == e.get("expected")), 0)
+                    if (exp_q - act_q) >= 3.0:
+                        big_mistakes.append((kyoku_name, e.get("junme")))
+
+        # 判定 A: 高评分 (>=82) 且重大失分均与推荐一致 -> 下限方差/不可抗力
+        if rating >= 82.0 and fatal_losses and all(fl["consistent"] for fl in fatal_losses):
+            loss_desc = "、".join([f"{fl['kyoku']}-{fl['pts']}点" for fl in fatal_losses[:2]])
+            return f"判定：下限方差（不可抗力）。……失分非恶手导致。\n{loss_desc}均与 Mortal 推荐一致。"
+
+        # 判定 B: 评分偏低或多次重大恶手 -> 技术问题
+        if rating < 78.0 or len(big_mistakes) >= 3:
+            return f"判定：技术偏差。……检出 {len(big_mistakes)} 处关键恶手。\n存在明显防守或造牌失误，建议复盘。"
+
+        # 判定 C: 存在偏离推荐的放铳
+        inconsistent_losses = [fl for fl in fatal_losses if not fl["consistent"]]
+        if inconsistent_losses:
+            loss_desc = inconsistent_losses[0]["kyoku"]
+            return f"判定：攻防失准。……{loss_desc}存在偏离推荐的激进打法。"
+
+        if rating >= 85.0:
+            return "判定：发挥稳定。……无重大决策失误。"
+        return "判定：局况平稳。……存在微弱期望损耗。"
+
     def _execute_review_sync(self, group_id: int, user_id: str, source_str: str) -> None:
         """同步执行审查、生成 HTML 并双通道交付。"""
         import sys, time
         from pathlib import Path
         for p_dir in [r"D:\tenhoulib\MortalSim", r"D:\tenhoulib"]:
-            if p_dir not in sys.path: sys.path.insert(0, p_dir)
+            if p_dir in sys.path:
+                sys.path.remove(p_dir)
+            sys.path.insert(0, p_dir)
+
+        # 深度防御：若 sys.modules 中缓存的 mortal_app 并非来自 MortalSim，强制清退重载
+        if "mortal_app" in sys.modules:
+            mod_file = getattr(sys.modules["mortal_app"], "__file__", "") or ""
+            if "MortalSim" not in mod_file:
+                for k in list(sys.modules.keys()):
+                    if k == "mortal_app" or k.startswith("mortal_app."):
+                        del sys.modules[k]
+
         from mortal_app.reviewer.fetcher import load_replay_to_mjai
         from mortal_app.reviewer.engine import run_multi_model_review
         from mortal_app.reviewer.web.packager import generate_standalone_review_html
 
         # 1. 解析 model 参数
-        model_name = "distill_41b_infer"
-        official_tag_name = "Logos"
+        model_name = "distill_consensus_v3"
+        official_tag_name = "Consensus"
         clean_source = source_str
         import re
 
@@ -643,11 +819,13 @@ class Bot:
         base_url = get_public_base_url()
         web_link = f"{base_url}/reviews/{report_token}.html"
 
-        # 精简高效文本回复，不再发送离线 html 群文件
+        attribution_verdict = self._analyze_review_attribution(review_result, target_seat)
+
         summary_msg = (
             f"【Mortal 牌谱检讨】\n"
             f"视角：{seat_zh}家 ({target_seat}号位) | 共 {total_rev} 巡\n"
             f"模型：{official_tag_name} | 评分：{rating_pct} | 吻合度：{match_pct}%\n"
+            f"{attribution_verdict}\n"
             f"🌐 在线复盘：{web_link}"
         )
         self._post_group_msg_sync(group_id, summary_msg)

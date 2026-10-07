@@ -22,6 +22,16 @@ def test_native_source_seat_matrix(round_id, wind, delta):
     validate_native_response(req, response_context(req))
 
 
+@pytest.mark.parametrize("round_id", [f"{w}{n}" for w in "ESW" for n in range(1, 5)])
+@pytest.mark.parametrize("wind,delta", [(w, d) for w in range(4) for d in (1, 2, 3)])
+def test_native_generated_source_cross_lap_matrix(round_id, wind, delta):
+    source = (wind + delta) % 4
+    cmd = command(round_id, wind, source, x=4, candidate=f"pon[{'东南西北'[source]}]:5p,pass")
+    cmd = cmd[:cmd.index("river=")] + cmd[cmd.index(" c=") + 1:]
+    req = parse(cmd)
+    validate_native_response(req, response_context(req))
+
+
 @pytest.mark.parametrize("called", TILES + ["0m", "0p", "0s"])
 def test_native_all_called_tiles(called):
     req = parse(command(called=called))

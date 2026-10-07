@@ -162,6 +162,8 @@ def response_context(request: dict) -> dict | None:
             raise ValueError("pon_consumed 只能用于碰牌候选")
         if c.get("call_tile") and tile(c["call_tile"]) != called:
             raise ValueError(f"副露目标{c['call_tile']}与玩家{actor}最新弃牌{called}不一致")
+        if c.get("call_from_seat") is not None and c["call_from_seat"] != actor:
+            raise ValueError("指定供牌家与牌河最新弃牌来源不一致")
         if k == "chi":
             consumed = [tile(t) for t in c.get("chi", [])]
             seq = sorted(map(base, consumed + [called]))
