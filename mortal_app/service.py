@@ -429,10 +429,8 @@ def resolve_simulation_context(request: dict[str, Any]) -> dict[str, Any]:
     kyoku = wind_index * 4 + round_number
 
     # Initial player IDs rotate through the dealer position across the round.
-    oya = (round_number - 1) % 4
-
-    target_seat = request.get("target_seat")
-    effective_target = int(target_seat) if target_seat is not None else oya
+    from .call_context import seat_coordinates
+    oya, effective_target, _ = seat_coordinates(request)
 
     honba = int(request.get("honba", 0))
     kyotaku = int(request.get("kyotaku", 0))
@@ -473,7 +471,8 @@ def resolve_simulation_context(request: dict[str, Any]) -> dict[str, Any]:
 
 def _parse_inputs(request: dict[str, Any]):
     # Reject impossible response worlds before loading native code or a model.
-    from .call_context import response_context, validate_native_response
+    from .call_context import response_context, validate_native_response, validate_draw_rivers
+    validate_draw_rivers(request)
     reaction = response_context(request)
     _prepare_imports(int(request.get("rayon_threads", 20)))
     if reaction is not None:
@@ -613,7 +612,7 @@ def _parse_inputs(request: dict[str, Any]):
 
     x = int(request.get("x", 1))
     if not 1 <= x <= 18:
-        raise ValueError(f"x 必须在 1..4 范围内，当前为 {x}")
+        raise ValueError(f"x 是巡目，必须在 1..18 范围内，当前为 {x}")
 
     def _parse_spec_item(item: Any, label: str) -> tuple[str, bool, bool]:
         if isinstance(item, (list, tuple)):

@@ -277,10 +277,10 @@ def _parse_river_spec(river_raw: str, target_seat: int, x: int = 1, oya: int = 0
         if strict and seen_seats != set(range(4)):
             return [], None, [], "显式响应牌河必须指定四家不同座位"
         has_opp = any(len(r) > 0 for i, r in enumerate(opponent_rivers) if i != target_seat)
-        return target_past, opponent_rivers if has_opp else None, melds, None
+        return target_past, opponent_rivers if has_opp or strict else None, melds, None
 
     # 2. 无命名分段：按斜杠 '/' 分隔
-    slash_sections = [s.strip() for s in re.split(r'[/|／｜]+', river_raw) if s.strip()]
+    slash_sections = [s.strip() for s in re.split(r'[/|／｜]', river_raw)]
     if len(slash_sections) == 4:
         for seat_idx, sec in enumerate(slash_sections):
             tokens = _parse_river_tokens_string(sec, strict=strict)
@@ -295,7 +295,7 @@ def _parse_river_spec(river_raw: str, target_seat: int, x: int = 1, oya: int = 0
                 else:
                     opponent_rivers[seat_idx].append((tile_s, ts, is_r))
         has_opp = any(len(r) > 0 for i, r in enumerate(opponent_rivers) if i != target_seat)
-        return target_past, opponent_rivers if has_opp else None, melds, None
+        return target_past, opponent_rivers if has_opp or strict else None, melds, None
     elif len(slash_sections) < 4:
         if strict:
             return [], None, [], "显式响应牌河必须完整指定四家（东/南/西/北），缺失座位不能自动补牌"
@@ -384,8 +384,8 @@ def _generate_default_rivers(
         for p in range(4):
             if p != target_seat and p < len(partial_opp_rivers):
                 rivers[p] = list(partial_opp_rivers[p] or [])
-    if call_target_tile and any(len(row) > limits[p] for p, row in enumerate(rivers)):
-        raise ValueError("指定供牌家与牌河时序不一致，不能补出未来弃牌")
+    if any(len(row) > limits[p] for p, row in enumerate(rivers)):
+        raise ValueError("指定牌河与当前巡目时序不一致，不能包含未来弃牌")
     seed_material = json.dumps(
         [sorted(hand_tiles), oya, target_seat, x, call_target_tile, call_player,
          dora_indicator, rivers], ensure_ascii=False, separators=(",", ":"),
@@ -924,10 +924,15 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
 
     parsed_target_past = None
     parsed_opp_rivers = None
+    complete_river = bool(river_raw and (
+        len(re.split(r"[/|／｜]", river_raw)) == 4
+        or len(re.findall(r"(?:^|[;；/|／｜\s,，])(?:东|南|西|北|[0-3eswnESWN])[:：=]", river_raw)) == 4
+    ))
     if river_raw:
         try:
             parsed_target_past, parsed_opp_rivers, prefix_melds, river_err = _parse_river_spec(
-                river_raw, effective_target_seat, x_val, effective_oya, strict=is_response,
+                river_raw, effective_target_seat, x_val, effective_oya,
+                strict=is_response or complete_river,
             )
         except ValueError as exc:
             return None, str(exc)
@@ -1004,7 +1009,7 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
         if len(set(ids)) != len(ids):
             return None, "响应候选重复，请勿重复指定相同吃/碰/过牌分支"
 
-    if river_raw and is_response:
+    if river_raw and (is_response or complete_river):
         # A specified river is evidence, never a template to pad with future discards.
         target_past, opp_rivers = parsed_target_past, parsed_opp_rivers
     elif river_raw or x_val >= 2 or effective_target_seat != 0:
@@ -1074,8 +1079,9 @@ def parse_sim_command(message: str) -> tuple[dict[str, Any] | None, str | None]:
 
     # Repeat at the service boundary: a direct API request must obey the same
     # clock and physical constraints, independent of the bot parser.
-    from mortal_app.call_context import response_context
+    from mortal_app.call_context import response_context, validate_draw_rivers
     try:
+        validate_draw_rivers(request)
         response_context(request)
     except ValueError as exc:
         return None, str(exc)

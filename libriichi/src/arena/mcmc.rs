@@ -592,6 +592,7 @@ mod tests {
         let opponent_rivers = [
             vec![
                 DiscardSpec { tile: parse_tile("E"), tsumogiri: false, is_riichi: false },
+                DiscardSpec { tile: parse_tile("S"), tsumogiri: true, is_riichi: false },
             ],
             vec![],
             vec![DiscardSpec { tile: parse_tile("W"), tsumogiri: false, is_riichi: false }],
@@ -628,6 +629,7 @@ mod tests {
         let opponent_rivers = [
             vec![
                 DiscardSpec { tile: parse_tile("E"), tsumogiri: false, is_riichi: false },
+                DiscardSpec { tile: parse_tile("S"), tsumogiri: true, is_riichi: false },
             ],
             vec![],
             vec![DiscardSpec { tile: parse_tile("W"), tsumogiri: false, is_riichi: false }],

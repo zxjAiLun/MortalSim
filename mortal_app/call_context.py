@@ -12,6 +12,56 @@ from typing import Any
 HONORS = dict(zip([f"{i}z" for i in range(1, 8)], "ESWNPFC"))
 
 
+def seat_coordinates(request: dict) -> tuple[int, int, int]:
+    """Return dealer ID, target ID, and CURRENT target wind (East=0).
+
+    API arrays use fixed player IDs. Only the bot command boundary converts
+    seat= and East/South/West/North river segments to these IDs.
+    """
+    round_id = request.get("round")
+    oya = int(str(round_id)[1]) - 1 if round_id else int(request.get("oya", 0))
+    target = request.get("target_seat")
+    target = oya if target is None else int(target)
+    if not 0 <= oya < 4 or not 0 <= target < 4:
+        raise ValueError("庄家和目标玩家编号必须在 0..3 范围内")
+    return oya, target, (target - oya) % 4
+
+
+def validate_draw_rivers(request: dict) -> None:
+    """Validate a closed-hand draw prefix before entering the native runner."""
+    candidates = request.get("discards") or []
+    if isinstance(candidates, str):
+        candidates = candidates.split(",")
+    if any(kind(c) in ("chi", "pon", "daiminkan", "ron", "pass") for c in candidates):
+        return
+    rivers = request.get("opponent_rivers")
+    if rivers is None:
+        return
+    if request.get("prefix_melds"):
+        raise ValueError("已有副露的牌河时序暂不支持，不能按未副露摸切顺序模拟")
+    oya, target, wind = seat_coordinates(request)
+    x = int(request.get("x", 1))
+    if not 1 <= x <= 18:
+        raise ValueError(f"x 是巡目，必须在 1..18 范围内，当前为 {x}")
+    if not isinstance(rivers, (list, tuple)) or len(rivers) != 4:
+        raise ValueError("摸牌决策必须提供四家牌河")
+    if rivers[target]:
+        raise ValueError("自家牌河只能通过 target_past_discards 提供，不能在 opponent_rivers 重复指定")
+    all_rivers = list(rivers)
+    all_rivers[target] = request.get("target_past_discards") or []
+    errors = []
+    for player, river in enumerate(all_rivers):
+        player_wind = (player - oya) % 4
+        expected = x - 1 + int(player_wind < wind)
+        if len(river) != expected:
+            errors.append(f"{'东南西北'[player_wind]}家有{len(river)}张弃牌，应为{expected}张")
+    if errors:
+        raise ValueError(
+            f"牌河时序矛盾：{request.get('round', '')}，东家为庄家，"
+            f"当前{'东南西北'[wind]}家第{x}巡摸牌后切牌；" + "；".join(errors)
+        )
+
+
 def tile(value: str) -> str:
     value = str(value)
     reverse = {v: k for k, v in HONORS.items()}
@@ -125,10 +175,7 @@ def response_context(request: dict) -> dict | None:
     hand = tiles(request["hand"])
     if len(hand) != 13 or request.get("first_tsumo") or request.get("prefix_melds"):
         raise ValueError("副露响应目前仅支持未副露的13张手牌；不能填入摸牌或省略已有副露")
-    oya = int(str(request.get("round", "E1"))[1]) - 1
-    target = request.get("target_seat")
-    target = oya if target is None else int(target)
-    wind = (target - oya) % 4
+    oya, target, wind = seat_coordinates(request)
     x = int(request.get("x", 1))
     if wind == 0 and x == 1:
         raise ValueError("东家(庄家)第1巡尚无上家弃牌，不能吃/碰/过；请使用真实响应时点（如 x=2）")

@@ -137,10 +137,10 @@ class RunRequest(BaseModel):
     strict_comparison: bool = True
     replay_of: UUID | None = None
     expected_trace_hash: str | None = None
-    target_seat: int | None = Field(default=None, ge=0, le=3, description="Target seat (0=East, 1=South, 2=West, 3=North); defaults to oya")
+    target_seat: int | None = Field(default=None, ge=0, le=3, description="Fixed player ID (0..3), not current seat wind; dealer=(round number-1), target=(dealer+current wind)%4; defaults to dealer")
     x: int = Field(default=1, ge=1, le=18, description="Target decision turn (1..=18)")
     target_past_discards: list[Any] | None = Field(default=None, description="Target past discards")
-    opponent_rivers: list[list[Any]] | None = Field(default=None, description="Opponents' river discards")
+    opponent_rivers: list[list[Any]] | None = Field(default=None, description="Four rivers indexed by fixed player ID, with an empty target slot; x is the target turn, not a seat ID")
     prefix_melds: list[Any] | None = Field(default=None, description="Historical prefix melds")
     tau: float = Field(default=1.0, gt=0.0, description="Softmax temperature for Boltzmann policy likelihood")
     weighted: bool = Field(default=False, description="Enable SNIS likelihood-weighted aggregation")

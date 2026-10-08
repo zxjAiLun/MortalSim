@@ -162,24 +162,34 @@ pub fn validate_inputs(
     ensure!(oya < 4, "oya must be 0..3");
     ensure!(x >= 1 && x <= 18, "x must be in 1..=18");
     let tp_len = target_past.len();
-    ensure!(
-        tp_len == (x - 1) as usize || tp_len == x as usize,
-        "target_past length ({}) must be x - 1 ({}) or x ({})",
-        tp_len,
-        x - 1,
-        x
-    );
+    ensure!(tp_len == (x - 1) as usize,
+            "target_past length ({}) must be x - 1 ({})", tp_len, x - 1);
+    ensure!(opponent_rivers[target_seat as usize].is_empty(),
+            "target river must only appear in target_past");
     for p in 0..4u8 {
         if p != target_seat {
             let r_len = opponent_rivers[p as usize].len();
-            ensure!(
-                r_len >= ((x - 1) as usize).saturating_sub(1) && r_len <= (x + 1) as usize,
-                "opponent {} river length ({}) out of valid range for turn {}",
-                p,
-                r_len,
-                x
-            );
+            if target_14.len() == 14 {
+                let expected = expected_discards(p, target_seat, oya, x);
+                ensure!(r_len == expected,
+                        "draw prefix: player {} river length {}, expected {} for turn {}",
+                        p, r_len, expected, x);
+            }
         }
+    }
+    if target_14.len() == 13 {
+        let total = tp_len + opponent_rivers.iter().map(Vec::len).sum::<usize>();
+        ensure!(total > 0 && total <= 4 * x as usize, "invalid response prefix length");
+        let mut seen = [0usize; 4];
+        for i in 0..total {
+            seen[(oya as usize + i) % 4] += 1;
+        }
+        for p in 0..4usize {
+            let actual = if p == target_seat as usize { tp_len } else { opponent_rivers[p].len() };
+            ensure!(actual == seen[p], "response prefix is not chronological at player {}", p);
+        }
+        ensure!((oya as usize + total - 1) % 4 != target_seat as usize,
+                "response prefix ends on target's own discard");
     }
     let counts = fixed_tile_counts(target_14, target_past, opponent_rivers, dora_marker);
     for b in 0..TILE_BUCKETS {
@@ -376,7 +386,6 @@ pub fn build_prefix_game_from_hands(
     // Build timeline draws
     let mut timeline_draws: Vec<Tile> = Vec::new();
     let mut forced_steps: Vec<PrefixStep> = Vec::new();
-    let mut target_decision_point_drawn = false;
     let mut target_tedashi_draw_idx = 0usize;
 
     if oya == target_seat {
@@ -406,8 +415,6 @@ pub fn build_prefix_game_from_hands(
         }
     }
 
-    let is_post_discard_reaction = target_past.len() == x as usize;
-
     'outer: for r in 1..=(x + 1) {
         for offset in 0..4u8 {
             let p = (oya + offset) % 4;
@@ -420,13 +427,15 @@ pub fn build_prefix_game_from_hands(
             };
 
             if !has_discard {
-                if p == target_seat && !target_decision_point_drawn {
-                    let next_draw = match target_14.get(13) {
-                        Some(&known_draw) => known_draw,
-                        None => pool.pop().context("insufficient pool for post-response draw")?,
-                    };
-                    timeline_draws.push(next_draw);
-                    target_decision_point_drawn = true;
+                if p == target_seat {
+                    // The dealer's first draw was already inserted above.
+                    if !(r == 1 && p == oya) {
+                        let next_draw = match target_14.get(13) {
+                            Some(&known_draw) => known_draw,
+                            None => pool.pop().context("insufficient pool for post-response draw")?,
+                        };
+                        timeline_draws.push(next_draw);
+                    }
                     break 'outer;
                 }
                 let remaining_any = (0..4u8).any(|check_p| {
@@ -633,6 +642,25 @@ mod tests {
             1, 0, 2, &target_14, &target_past, &opponent_rivers,
             parse_tile("8s"), 1, 0, 0, [25000; 4], (12345, 67890),
         ).unwrap()
+    }
+
+    #[test]
+    fn dealer_first_draw_with_empty_rivers_preserves_136_tiles() {
+        let hand: Vec<Tile> = ["2m", "5m", "5m", "7m", "8m", "8m", "4p",
+            "4p", "3s", "3s", "E", "E", "P", "P"].into_iter().map(parse_tile).collect();
+        for oya in 0..4 {
+            let spec = sample_prefix_game(oya, oya, 1, &hand, &[], &[vec![], vec![], vec![], vec![]],
+                parse_tile("3m"), oya + 1, 0, 0, [25000; 4], (42, 57005)).unwrap();
+            let mut counts = [0u8; TILE_BUCKETS];
+            for h in &spec.board.haipai { assert!(add_tiles_count(&mut counts, h)); }
+            for group in [&spec.board.yama, &spec.board.rinshan, &spec.board.dora_indicators, &spec.board.ura_indicators] {
+                assert!(add_tiles_count(&mut counts, group));
+            }
+            assert_eq!(counts.iter().map(|&n| n as usize).sum::<usize>(), 136);
+            assert_eq!(spec.board.yama.len(), 70);
+            assert_eq!(spec.board.yama.last(), hand.last());
+            assert!(spec.forced_steps.is_empty());
+        }
     }
 
     #[test]
